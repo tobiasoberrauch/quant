@@ -1,0 +1,211 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════
+//  Modular Strategy Framework — TradingView edition (mirrors quantconnect/)
+//
+//  Layers
+//    1. CORE      shared indicators, computed once per bar
+//    2. FILTERS   shared vetoes (trend, ADX, volatility, session)
+//    3. SIGNALS   one entry signal per setup
+//    4. SETUPS    signal + chosen filters + exits + sizing, each with its own
+//                 entry id and state (stop / target / trailing / time exit)
+//    5. BRIDGE    3Commas Signal Bot JSON in every order's alert_message
+//
+//  Adding a setup = add an input group, a signal line and one f_run() call.
+//
+//  3Commas: create ONE alert on this strategy, condition "Order fills",
+//  message  {{strategy.order.alert_message}}
+//  webhook  https://api.3commas.io/signal_bots/webhooks
+//
+//  Note: TradingView nets all entries into one position per chart, so a setup
+//  cannot open against a position held by another setup (same rule as the
+//  Python RiskManager with allow_opposing = false).
+// ═══════════════════════════════════════════════════════════════════════════
+strategy("Modular Strategy Framework", shorttitle = "MSF", overlay = true, pyramiding = 3,
+     initial_capital = 100000, default_qty_type = strategy.fixed, default_qty_value = 1,
+     commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2,
+     process_orders_on_close = true)
+
+// ─── 1. CORE: shared indicator parameters ─────────────────────────────────
+grpCore    = "Core building blocks"
+emaFastLen = input.int(20, "EMA fast", minval = 1, group = grpCore, inline = "ema")
+emaSlowLen = input.int(50, "slow", minval = 2, group = grpCore, inline = "ema")
+trendLen   = input.int(200, "Trend SMA", minval = 2, group = grpCore)
+rsiLen     = input.int(2, "RSI length", minval = 1, group = grpCore, inline = "rsi")
+rsiLower   = input.float(10, "oversold", group = grpCore, inline = "rsi")
+rsiUpper   = input.float(90, "overbought", group = grpCore, inline = "rsi")
+dcLen      = input.int(55, "Donchian length", minval = 2, group = grpCore)
+atrLen     = input.int(14, "ATR length", minval = 1, group = grpCore)
+adxLen     = input.int(14, "ADX length", minval = 1, group = grpCore)
+
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+trendMa = ta.sma(close, trendLen)
+rsi     = ta.rsi(close, rsiLen)
+atr     = ta.atr(atrLen)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+dcUpper = ta.highest(high, dcLen)[1]   // previous N bars, current bar excluded
+dcLower = ta.lowest(low, dcLen)[1]
+
+// ─── 2. FILTERS (shared) ──────────────────────────────────────────────────
+grpF       = "Filters (shared parameters)"
+adxMin     = input.float(18, "ADX minimum", group = grpF)
+volMinPct  = input.float(0.3, "ATR % min", group = grpF, inline = "vol")
+volMaxPct  = input.float(5.0, "max", group = grpF, inline = "vol")
+sessionStr = input.session("0930-1600", "Session", group = grpF)
+
+inSession = not na(time(timeframe.period, sessionStr))
+atrPct    = atr / close * 100
+
+f_trendOk(int dir) => dir == 1 ? close > trendMa : close < trendMa
+f_adxOk()          => adx >= adxMin
+f_volOk()          => atrPct >= volMinPct and atrPct <= volMaxPct
+
+f_filters(int dir, bool useTrend, bool useAdx, bool useVol, bool useSess) =>
+    (not useTrend or f_trendOk(dir)) and (not useAdx or f_adxOk()) and (not useVol or f_volOk()) and (not useSess or inSession)
+
+f_dirAllowed(int dir, string mode) =>
+    mode == "Both" or (mode == "Long" and dir == 1) or (mode == "Short" and dir == -1)
+
+// never open against the net position held by another setup
+f_noOpposite(int dir) => strategy.position_size == 0 or math.sign(strategy.position_size) == dir
+
+// ─── Risk & sizing (shared) ───────────────────────────────────────────────
+grpR        = "Risk & sizing"
+riskPct     = input.float(1.0, "Risk per trade (% equity)", minval = 0.01, step = 0.25, group = grpR)
+maxAllocPct = input.float(30, "Max allocation per trade (%)", minval = 1, group = grpR)
+qtyStep     = input.float(1, "Quantity step (1 = shares, 0.0001 = crypto)", minval = 0.00000001, group = grpR)
+
+f_qty(float stopDist) =>
+    float riskQty = strategy.equity * riskPct / 100 / stopDist
+    float maxQty  = strategy.equity * maxAllocPct / 100 / close
+    math.floor(math.min(riskQty, maxQty) / qtyStep) * qtyStep
+
+// ─── 5. BRIDGE: 3Commas Signal Bot payload ────────────────────────────────
+grp3     = "3Commas Signal Bot"
+tcSecret = input.string("", "Secret", group = grp3)
+tcUuid   = input.string("", "Bot UUID", group = grp3)
+tcMaxLag = input.int(300, "Max lag (s)", group = grp3)
+
+f_3c(string action) =>
+    '{"secret":"' + tcSecret + '","max_lag":"' + str.tostring(tcMaxLag) +
+     '","timestamp":"{{timenow}}","trigger_price":"{{close}}","tv_exchange":"{{exchange}}"' +
+     ',"tv_instrument":"{{ticker}}","action":"' + action + '","bot_uuid":"' + tcUuid + '"}'
+
+// ─── 4. SETUP ENGINE ──────────────────────────────────────────────────────
+type SetupState
+    int   dir      = 0
+    float stop     = na
+    float target   = na
+    int   entryBar = 0
+
+f_isOpen(string id) =>
+    bool found = false
+    if strategy.opentrades > 0
+        for i = 0 to strategy.opentrades - 1
+            if strategy.opentrades.entry_id(i) == id
+                found := true
+    found
+
+// Runs one setup: manage the open trade or look for a new entry.
+f_run(SetupState s, string id, bool enabled, int sig, string dirMode, bool uTrend, bool uAdx,
+     bool uVol, bool uSess, float stopMult, float trailMult, float rTarget, int maxBars) =>
+    bool isOpen = f_isOpen(id)
+    if not isOpen and s.dir != 0      // closed by stop / target since last bar
+        s.dir    := 0
+        s.stop   := na
+        s.target := na
+    if isOpen
+        if trailMult > 0              // trailing stop only ever tightens
+            float trail = close - s.dir * trailMult * atr
+            s.stop := s.dir == 1 ? math.max(s.stop, trail) : math.min(s.stop, trail)
+        string exitAction = s.dir == 1 ? "exit_long" : "exit_short"
+        if maxBars > 0 and bar_index - s.entryBar >= maxBars
+            strategy.close(id, comment = id + " time", alert_message = f_3c(exitAction))
+        else
+            strategy.exit(id + "-x", from_entry = id, stop = s.stop, limit = s.target,
+                 comment_loss = id + " stop", comment_profit = id + " target", alert_message = f_3c(exitAction))
+    else if enabled and sig != 0 and atr > 0 and f_dirAllowed(sig, dirMode) and f_noOpposite(sig) and f_filters(sig, uTrend, uAdx, uVol, uSess)
+        float stopDist = stopMult * atr
+        float qty      = f_qty(stopDist)
+        if qty > 0
+            s.dir      := sig
+            s.stop     := close - sig * stopDist
+            s.target   := rTarget > 0 ? close + sig * rTarget * stopDist : na
+            s.entryBar := bar_index
+            strategy.entry(id, sig == 1 ? strategy.long : strategy.short, qty = qty, comment = id,
+                 alert_message = f_3c(sig == 1 ? "enter_long" : "enter_short"))
+            strategy.exit(id + "-x", from_entry = id, stop = s.stop, limit = s.target,
+                 comment_loss = id + " stop", comment_profit = id + " target",
+                 alert_message = f_3c(sig == 1 ? "exit_long" : "exit_short"))
+    s.stop
+
+// ─── 3. SIGNALS + setup definitions ───────────────────────────────────────
+DIRS = "Direction"
+
+// Setup A · Trend following (EMA cross)
+grpA     = "Setup A · Trend follow (EMA cross)"
+aOn      = input.bool(true, "Enabled", group = grpA)
+aDir     = input.string("Long", DIRS, options = ["Both", "Long", "Short"], group = grpA)
+aTrend   = input.bool(true, "Trend", group = grpA, inline = "aF")
+aAdx     = input.bool(true, "ADX", group = grpA, inline = "aF")
+aVol     = input.bool(false, "Vol", group = grpA, inline = "aF")
+aSess    = input.bool(false, "Session", group = grpA, inline = "aF")
+aStop    = input.float(2.5, "Stop ATR×", group = grpA, inline = "aX")
+aTrail   = input.float(3.5, "Trail ATR× (0=off)", group = grpA, inline = "aX")
+aR       = input.float(0, "Target R (0=off)", group = grpA, inline = "aY")
+aMaxBars = input.int(0, "Time exit bars (0=off)", group = grpA, inline = "aY")
+
+emaUp = ta.crossover(emaFast, emaSlow)
+emaDn = ta.crossunder(emaFast, emaSlow)
+sigA  = emaUp ? 1 : emaDn ? -1 : 0
+
+// Setup B · Mean reversion (RSI)
+grpB     = "Setup B · Mean reversion (RSI)"
+bOn      = input.bool(true, "Enabled", group = grpB)
+bDir     = input.string("Long", DIRS, options = ["Both", "Long", "Short"], group = grpB)
+bTrend   = input.bool(true, "Trend", group = grpB, inline = "bF")
+bAdx     = input.bool(false, "ADX", group = grpB, inline = "bF")
+bVol     = input.bool(false, "Vol", group = grpB, inline = "bF")
+bSess    = input.bool(false, "Session", group = grpB, inline = "bF")
+bStop    = input.float(2.0, "Stop ATR×", group = grpB, inline = "bX")
+bTrail   = input.float(0, "Trail ATR× (0=off)", group = grpB, inline = "bX")
+bR       = input.float(1.5, "Target R (0=off)", group = grpB, inline = "bY")
+bMaxBars = input.int(7, "Time exit bars (0=off)", group = grpB, inline = "bY")
+
+rsiUp = ta.crossover(rsi, rsiLower)
+rsiDn = ta.crossunder(rsi, rsiUpper)
+sigB  = rsiUp ? 1 : rsiDn ? -1 : 0
+
+// Setup C · Donchian breakout
+grpC     = "Setup C · Breakout (Donchian)"
+cOn      = input.bool(true, "Enabled", group = grpC)
+cDir     = input.string("Both", DIRS, options = ["Both", "Long", "Short"], group = grpC)
+cTrend   = input.bool(true, "Trend", group = grpC, inline = "cF")
+cAdx     = input.bool(false, "ADX", group = grpC, inline = "cF")
+cVol     = input.bool(true, "Vol", group = grpC, inline = "cF")
+cSess    = input.bool(false, "Session", group = grpC, inline = "cF")
+cStop    = input.float(2.0, "Stop ATR×", group = grpC, inline = "cX")
+cTrail   = input.float(3.0, "Trail ATR× (0=off)", group = grpC, inline = "cX")
+cR       = input.float(0, "Target R (0=off)", group = grpC, inline = "cY")
+cMaxBars = input.int(0, "Time exit bars (0=off)", group = grpC, inline = "cY")
+
+sigC = close > dcUpper ? 1 : close < dcLower ? -1 : 0
+
+// ─── Run all setups (order = priority when several fire on the same bar) ──
+var SetupState sA = SetupState.new()
+var SetupState sB = SetupState.new()
+var SetupState sC = SetupState.new()
+
+stopA = f_run(sA, "A", aOn, sigA, aDir, aTrend, aAdx, aVol, aSess, aStop, aTrail, aR, aMaxBars)
+stopB = f_run(sB, "B", bOn, sigB, bDir, bTrend, bAdx, bVol, bSess, bStop, bTrail, bR, bMaxBars)
+stopC = f_run(sC, "C", cOn, sigC, cDir, cTrend, cAdx, cVol, cSess, cStop, cTrail, cR, cMaxBars)
+
+// ─── Plots ────────────────────────────────────────────────────────────────
+plot(emaFast, "EMA fast", color.new(color.teal, 0))
+plot(emaSlow, "EMA slow", color.new(color.orange, 0))
+plot(trendMa, "Trend SMA", color.new(color.gray, 0), 2)
+plot(dcUpper, "Donchian upper", color.new(color.blue, 70))
+plot(dcLower, "Donchian lower", color.new(color.blue, 70))
+plot(sA.dir != 0 ? stopA : na, "Stop A", color.red, style = plot.style_linebr)
+plot(sB.dir != 0 ? stopB : na, "Stop B", color.fuchsia, style = plot.style_linebr)
+plot(sC.dir != 0 ? stopC : na, "Stop C", color.maroon, style = plot.style_linebr)

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+results/
+data/*.csv
+.venv/
+.lean/
+backtests/
